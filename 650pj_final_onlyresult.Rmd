@@ -1,0 +1,596 @@
+---
+title: "650-PJ"
+author: "650squad"
+date: "11/8/2021"
+output: pdf_document
+header-includes:
+    - \usepackage{caption}
+
+---
+\captionsetup[table]{labelformat=empty}
+
+```{r, include=FALSE}
+##########Clean up and import package:
+
+rm(list=ls(all=TRUE))  #same to clear all in stata
+cat("\014")
+
+x<-c("NHANES","tidyverse", "gtsummary","knitr","stringr","stringi","corrplot","ggrepel","olsrr","kableExtra","emmeans")
+
+new.packages<-x[!(x %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+
+lapply(x, require, character.only=T)
+coalesce <- function(...) {
+  apply(cbind(...), 1, function(x) {
+    x[which(!is.na(x))[1]]
+  })
+}
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r, include=FALSE}
+data("NHANES")
+dim(NHANES)
+
+#1. Create variable needed for the analysis:
+var_needed=c("Age","Gender","BMI","Drugs","PhysActive","Smoker","AlcoholYear","BPSysAve","BPDiaAve","Race1")
+
+# combine regularMariji and HardDrugs into one variable Drugs | calculate Cholratio (DirectChol/TotChol) optimal ratio:1~3.5 | subset by the marital status(Never vs married)
+raw_NHANES <- NHANES %>% mutate(Drugs = case_when(
+  RegularMarij == 'Yes' | HardDrugs == 'Yes' ~ 'Yes',
+  RegularMarij == 'No' & HardDrugs == 'No' ~ 'No',
+)) %>% 
+  mutate(Cholratio = TotChol/DirectChol)%>% mutate(NeverMarried = case_when(
+    MaritalStatus == "NeverMarried" ~ 'Yes',
+    MaritalStatus == "Married" ~ 'No',
+  )) %>% mutate(Female = case_when(
+    Gender == "female" ~ 'Yes',
+    Gender == "male" ~ 'No',
+  )) %>% mutate(Smoker=case_when(
+    SmokeNow == "Yes" ~ 1,
+    SmokeNow == "No" ~ 0,
+  )) %>%
+  select(var_needed) 
+
+#Create complete case indicator:
+raw_NHANES$complete=complete.cases(raw_NHANES)
+raw_NHANES=raw_NHANES %>%
+  mutate(Incomplete=ifelse(complete==0,"Incomplete","Complete")) %>%
+  select(!complete)
+table(raw_NHANES$Incomplete)
+
+
+```
+
+ 
+# Table 1a. baseline information By the completeness of the dataset (Or in the sensitivity analysis)
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+raw_NHANES %>% 
+  tbl_summary(by = Incomplete, missing = "no",
+              type = list(Drugs ~ 'dichotomous'),
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              ) %>% add_n %>% 
+  add_p(test = list(BPSysAve ~ "t.test",
+                    BPDiaAve ~ "t.test",
+                    AlcoholYear ~ "t.test",
+                    BMI ~ "t.test",
+                    Age ~ "t.test",
+                    Gender ~ "chisq.test"
+                    ),
+        test.args = all_tests("t.test") ~ list(var.equal = TRUE)
+        ) %>% bold_p(t =0.05) %>% bold_labels  %>%
+  modify_caption("Table 1a. Baseline information By the completeness of the dataset ") 
+```
+
+\newpage
+
+# Table 1b. Demographic information comparing Somkers to non-smokers:
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+complete_NHANS=raw_NHANES %>% 
+  filter(Incomplete=="Complete")
+complete_NHANS=complete_NHANS[,names(complete_NHANS)!="Incomplete"]
+
+
+
+complete_NHANS%>%
+  tbl_summary(by = Smoker, missing = "no",
+              type = list(Drugs ~ 'dichotomous'
+                          ),
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              ) %>% add_n %>% 
+  add_p(test = list(BPSysAve ~ "t.test",
+                    BPDiaAve ~ "t.test",
+                    AlcoholYear ~ "t.test",
+                    BMI ~ "t.test",
+                    Gender ~ "chisq.test"
+                    ),
+        test.args = all_tests("t.test") ~ list(var.equal = TRUE)
+        ) %>% bold_p(t =0.05) %>% bold_labels  %>%
+  modify_caption("Table 1b. Demographic information comparing Smokers to non-smokers ") 
+```
+\newpage
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+#add Headers:
+getHeader<-function(data,outcome){
+  header<-summary(data[[outcome]])
+  header<-c(sum(header),header,"")
+  level<-levels(data[[outcome]])
+  names(header)<-c("Total",level,"P-value")
+  ##bind row names
+  length<-length(header)-1
+  rownum<-c("")
+  for(i in 1:length) {
+    rownum<-c(rownum,"")
+  }
+  header<-rbind(rownum,header)
+  row.names(header)<-c("","N")
+  return(header)
+}
+
+
+
+##Get regression fit:
+GetSLR=function(contlist=NULL,catlist=NULL,data,outcome,digit=digit){
+    ##Continous variables:
+  tbl=list()
+  
+  if(length(contlist)!=0){
+    for(i in 1:length(contlist)){
+      if(is.list(contlist)){
+        varname=names(contlist)[i]
+        varlab=contlist[[i]][1]
+        if(length(varname)==0){
+          varname=varlab
+        } else if (varname==""){
+          varname=varlab
+        }
+      } else {
+        varname=contlist[i]
+        varlab=contlist[i]
+      }
+      
+      formula<-paste(outcome,"~",varname)
+      fit<-lm(formula,data=data)
+      ##Get coefs:
+      coef=round(summary(fit)$coef[-1,],digits = digit)
+      if(coef["Pr(>|t|)"]==0){
+        coef["Pr(>|t|)"]="<0.01"
+      }
+      ci=paste0(round(confint(fit)[-1,],digits=digit),collapse = ",")
+      names(ci)="95%CI"
+      coef=c(coef,ci)[c(1,2,3,5,4)]
+      ##Add 95%CI
+      tbl[[varlab]]=coef
+    }
+  }
+  
+  
+  
+  varname="EducationHS"
+  if(length(catlist)!=0){
+    for(i in 1:length(catlist)){
+      if(is.list(catlist)){
+        varname=names(catlist)[i]
+        varlab=catlist[[i]][1]
+        if(length(varname)==0){
+          varname=varlab
+        } else if (varname==""){
+          varname=varlab
+        }
+      } else {
+        varname=catlist[i]
+        varlab=catlist[i]
+      }
+      
+      formula<-paste(outcome,"~ as.factor(",varname,")")
+      fit<-lm(formula,data=data)
+      ##Get coefs:
+      coef=round(summary(fit)$coef[-1,],digits = digit)
+      names= rownames(summary(fit)$coef)[-1]
+      ##extract names
+      names=gsub(paste0("as.factor\\(",varname,"\\)"),"",names)
+      ref_level=levels(as.factor(data[[varname]]))[!(levels(as.factor(data[[varname]])) %in% names)]
+      
+      if(!is.matrix(coef)){
+        ci=paste0(round(confint(fit)[-1,],digits=digit),collapse = ",")
+        names(ci)="95%CI"
+        coef=c(coef,ci)
+        if(coef["Pr(>|t|)"]=="0"){
+          coef["Pr(>|t|)"]="<0.01"
+        }
+        
+      } else {
+        
+        ci=round(confint(fit)[-1,],digits=digit)
+        n=nrow(ci)
+        for(i in 1:n){
+          ci[i,"2.5 %"]=paste0(ci[i,],collapse = ",")
+          if(as.character(coef[i,"Pr(>|t|)"])=="0"){
+            coef[i,"Pr(>|t|)"]="<0.01"
+          }
+        }
+        coef=cbind(coef,ci)[,-6]
+        colnames(coef)[5]="95%CI"
+  
+      }
+      coef=rbind(c("Reference","-","-","-","-"),coef)
+      rownames(coef)=c(ref_level,names)
+      coef=coef[,c(1,2,3,5,4)]
+      tbl[[varlab]]=coef
+    }
+  }
+  return(tbl)
+}
+
+GetMLR=function(fit,digit=2){
+   # fit=fit2
+   # digit=2
+  outcome=fit$terms[[2]]
+  varlist=names(fit$model)[-1]
+  interactionlist=as.character(fit$terms[[3]])[3]
+  interactionlist=str_replace_all(interactionlist," \\* ",":")
+  lm_name=rownames(summary(fit)$coef)
+  tbl=list()
+  
+  
+  #get intercept:
+  intercept=round(summary(fit)$coef[1,],digits = digit)
+  if(intercept[length(intercept)]==0){
+    intercept[length(intercept)]="<0.01"
+  }
+  ci=paste0(round(confint(fit)[1,],digits=digit),collapse = ",")
+  names(ci)="95%CI"
+  intercept=c(intercept,ci)[c(1,2,3,5,4)]
+  ##Add 95%CI
+  tbl[["Intercept"]]=intercept
+  
+  ##Add the variables:
+  for(var in varlist){
+    #Continous
+    if(!grepl("as.factor",var)){
+      coef=round(summary(fit)$coef[var,],digits = digit)
+      if(coef[length(coef)]==0){
+        coef[length(coef)]="<0.01"
+      }
+      ci=paste0(round(confint(fit)[var,],digits=digit),collapse = ",")
+      names(ci)="95%CI"
+      coef=c(coef,ci)[c(1,2,3,5,4)]
+      ##Add 95%CI
+      tbl[[var]]=coef
+    }
+    else { #Categorical variables:
+      
+      #Overall levels of this category:
+      level_cat=levels(fit$model[,var])
+      
+      catvarlist=lm_name[stri_detect_fixed(lm_name,var)]
+      var_clean=str_remove_all(var,"as.factor\\(|\\)")
+      compare_group=str_remove_all(catvarlist,paste0("as.factor\\(",var_clean,"\\)"))
+      ref_group=level_cat[!(level_cat %in% compare_group)]
+      
+      #Reference group:
+      coef_all=c("Reference","-","-","-","-")
+      
+      for(cat in compare_group){
+        catvar=paste0(var,cat)
+        coef=round(summary(fit)$coef[catvar,],digits = digit)
+        if(coef[length(coef)]==0){
+          coef[length(coef)]="<0.01"
+        }
+        ci=paste0(round(confint(fit)[catvar,],digits=digit),collapse = ",")
+        names(ci)="95%CI"
+        coef=c(coef,ci)
+        coef_all=rbind(coef_all,coef)
+      }
+      rownames(coef_all)=c(ref_group,compare_group)
+      coef_all=coef_all[,c(1,2,3,5,4)]
+      tbl[[var_clean]]=coef_all
+    }
+  }
+  
+  #Get interaction term:
+  for(var in interactionlist){
+    coef=round(summary(fit)$coef[var,],digits = digit)
+    if(coef[length(coef)]==0){
+      coef[length(coef)]="<0.01"
+    }
+    ci=paste0(round(confint(fit)[var,],digits=digit),collapse = ",")
+    names(ci)="95%CI"
+    coef=c(coef,ci)[c(1,2,3,5,4)]
+    ##Add 95%CI
+    tbl[[var]]=coef
+  }
+
+  return(tbl)
+}
+
+```
+
+
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+#save everything in a list
+##regression:
+complete_NHANS=complete_NHANS %>%
+   mutate(Age_c=Age-40,
+          BMI_c=BMI-27)
+
+#complete_NHANS
+contlist<-list("Age_c","BMI_c","AlcoholYear")
+catlist<-list("Gender","PhysActive","Smoker","Drugs","Race1")
+
+
+table_data=GetSLR(contlist=contlist,catlist=catlist,data=complete_NHANS,outcome="BPSysAve",digit=2)
+
+
+#Merge everything into matrix:
+rgroup<-c()
+n.rgroup<-c()
+output_data<-NULL
+group=list()
+for(varlabel in names(table_data)) {
+  output_data<-rbind(output_data,
+                     table_data[[varlabel]])
+  rgroup<-c(rgroup,varlabel)
+  
+  count<-nrow(table_data[[varlabel]])
+  if(length(count)==0){
+    count<-1
+  }
+  n.rgroup<-c(n.rgroup,
+              count)
+  
+}
+names(n.rgroup)=rgroup
+library(kableExtra)
+
+
+kable(output_data,caption = "Table2: Simple Linear Regression By SBP",booktabs = T) %>% pack_rows(
+  index=n.rgroup
+) 
+
+
+
+```
+
+\newpage
+
+MLR with interaction
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+# main effecet model 1
+fit1 = lm(BPSysAve~Age_c+BMI_c+as.factor(Gender)+as.factor(Drugs)+as.factor(PhysActive)+as.factor(Smoker)+as.factor(Race1)+AlcoholYear,data =complete_NHANS )
+
+
+#interaction smoker*alcohol model 2  ----->Final Model
+fit2 = lm(BPSysAve~Age_c+BMI_c+as.factor(Gender) +as.factor(Drugs)+as.factor(Race1)+as.factor(PhysActive)+Smoker*AlcoholYear,data =complete_NHANS )
+
+##Get regression fit:
+
+table_data=GetMLR(fit2)
+
+#Merge everything into matrix:
+rgroup<-c()
+n.rgroup<-c()
+output_data<-NULL
+group=list()
+for(varlabel in names(table_data)) {
+  output_data<-rbind(output_data,
+                     table_data[[varlabel]])
+  rgroup<-c(rgroup,varlabel)
+  
+  count<-nrow(table_data[[varlabel]])
+  if(length(count)==0){
+    count<-1
+  }
+  n.rgroup<-c(n.rgroup,
+              count)
+  
+}
+names(n.rgroup)=rgroup
+
+
+kable(output_data,caption = "Table3b. Multiple Linear Regression By SBP with interaction",booktabs = T) %>% pack_rows(
+  index=n.rgroup
+) 
+
+
+
+
+```
+
+
+##interaction plot and anova table
+```{r}
+##interaction plot
+complete_NHANS$Smoking = ifelse(complete_NHANS$Smoker ==0, "NonSmoker","Smoker")
+complete_NHANS$Smoking =factor(complete_NHANS$Smoking)
+complete_NHANS$Smoking = relevel(complete_NHANS$Smoking,ref="NonSmoker")
+contact = lm(BPSysAve~Age_c+BMI_c+as.factor(Gender) +as.factor(Drugs)+as.factor(Race1)+as.factor(PhysActive)+Smoking*AlcoholYear,data =complete_NHANS )
+(mylist <- list(AlcoholYear=seq(0,365,by=7)))
+emmip(contact, Smoking ~AlcoholYear, at=mylist,CIs=TRUE,ylab = "Systolic Blood Pressure")
+
+
+contcontdat <- emmip(contact,Smoking ~AlcoholYear,at=mylist, CIs=TRUE, plotit=FALSE)
+p <- ggplot(data=contcontdat, aes(x=AlcoholYear,y=yvar, color=Smoking)) + geom_line()+ geom_ribbon(aes(ymax=UCL, ymin=LCL, fill=Smoking), alpha=0.4) + labs( y="Systolic Blood Pressure", color="Smoking", fill="Smoking") + ggtitle("Plot1. The interaction plot for systolic blood pressure")
+p
+
+mylist2 = list(AlcoholYear= c(0), Smoking = c("Smoker","NonSmoker"))
+emmeans(contact, pairwise ~ AlcoholYear*Smoking, at=mylist2)
+mylist3 = list(AlcoholYear= c(48), Smoking = c("Smoker","NonSmoker"))
+emmeans(contact, pairwise ~ AlcoholYear*Smoking, at=mylist3)
+mylist4 = list(AlcoholYear= c(156), Smoking = c("Smoker","NonSmoker"))
+emmeans(contact, pairwise ~ AlcoholYear*Smoking, at=mylist4)
+
+
+##Anova table: test the significance of smoker covariate
+wo_smoker = lm(BPSysAve~Age_c+BMI_c+as.factor(Gender) +as.factor(Drugs)+as.factor(Race1)+as.factor(PhysActive)+AlcoholYear,data =complete_NHANS )
+t= anova(contact,wo_smoker)
+
+rownames(t) = c("Restricted Model","Full Model")
+options(knitr.kable.NA = '')
+kable(t,caption = "Table4. ANOVA Table",booktabs = T) 
+
+```
+
+
+\newpage
+
+
+From the model above, we see significant interaction effect between smoker and alcohol, This is consistent with our literiture review.
+
+
+MLR without interaction:
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+
+##Get regression fit:
+
+table_data=GetMLR(fit1)
+
+#Merge everything into matrix:
+rgroup<-c()
+n.rgroup<-c()
+output_data<-NULL
+group=list()
+for(varlabel in names(table_data)) {
+  output_data<-rbind(output_data,
+                     table_data[[varlabel]])
+  rgroup<-c(rgroup,varlabel)
+  
+  count<-nrow(table_data[[varlabel]])
+  if(length(count)==0){
+    count<-1
+  }
+  n.rgroup<-c(n.rgroup,
+              count)
+  
+}
+names(n.rgroup)=rgroup
+
+
+kable(output_data,caption = "Table3a. Multiple Linear Regression By SBP without interaction",booktabs = T) %>% pack_rows(
+  index=n.rgroup
+)
+
+```
+\newpage
+
+## Model diagnosis:
+
+* 1. Linear function:
+
+We are using the partial residual plot to access the linearity of our final model. 
+
+```{r, warning=FALSE, echo=FALSE}
+car::avPlots(fit2)
+
+```
+\newpage
+
+From the partial regression plot above, we noticed that All the variable fitted is roughly normal. Thus, there is no need to include other forms of covariates. The assumption of linearity is roughly met
+
+* 2. Equal Variance and normality assumption:
+
+Here, we use the residual vs fited value plot to elvaluate the equal variance assumptions and QQ-plot to access the normality assumption:
+
+
+```{r, warning=FALSE, echo=FALSE}
+plot(fit2)
+
+```
+\newpage
+
+From the residual plot above, we could observe that the residuals is roughly randomly scatter around 0 across fitted values. Thus the equal variance assumption might be qualified. 
+
+However, the normality assumption might not be satisfied based on the QQplot, However, since our dataset is large enough(around 2000) obeservations, from the central limit theory, we don't need to worry about the nomarlity assumption.
+
+
+## Outliers
+
+```{r}
+### If model is changed, only the fit2 needs to be changed
+fit = fit2
+
+m.dffits = dffits(fit)
+m.dfbeta = dfbetas(fit)
+m.D = cooks.distance(fit)
+m.covratio = covratio(fit)
+```
+
+## DFFITS, COOKS' DISTANCE, DFBETAS
+```{r}
+n = nrow(complete_NHANS); p = fit$rank
+plot(fit2,which = 4); abline(h = 4/n,lty=2,col = "darkred")
+olsrr::ols_plot_dffits(fit)
+olsrr::ols_plot_dfbetas(fit)
+olsrr::ols_plot_cooksd_bar(fit)
+olsrr::ols_plot_resid_lev(fit)
+```
+
+
+## dfbetas for smoker alone, if necessary, "smoker" can be replaced by any other variable.
+```{r}
+n = nrow(m.dfbeta)
+np = ncol(m.dfbeta)
+threshold = 2/sqrt(n)
+dbetas = m.dfbeta[,"Smoker"]
+df_data = data.frame(obs=seq_len(n),dbetas =dbetas)
+d = olsrr::ols_prep_dfbeta_data(df_data,threshold)
+f = olsrr::ols_prep_dfbeta_outliers(d)
+ggplot(d,aes(x= obs,y=dbetas,label = txt,ymin = 0, ymax=dbetas)) + geom_linerange(colour = "blue") +geom_hline(yintercept = c(0,-threshold,threshold),colour = "red") + geom_point(colour = "blue",shape = 1) +xlab("observation") + ylab("DFBETAS") +ggtitle("Influence Diagnostics for Smoker") +
+  geom_text(hjust = -0.2, nudge_x = 0.15,size = 2, family = "serif",fontface = "italic", colour = "darkred",na.rm= T)+ annotate("text",x= Inf,y=Inf,hjust = 1,vjust = 1,family = "serif",fontface = "italic", colour = "darkred",label = paste("Threshold:",round(threshold,2)))
+```
+##Covratio
+```{r}
+influence_less_1 = rep(NA_integer_, length(m.covratio))
+for (i in 1:length(m.covratio)){
+  if (m.covratio[i]< 1-3*p/n){
+    influence_less_1[i] = i
+  }
+}
+covtable = as.data.frame(cbind(index = 1:length(m.covratio),cov = m.covratio,txt = influence_less_1))
+
+library(ggrepel)
+(cov2 = ggplot(covtable,aes(x=index,y=cov,label =txt))+geom_point()+geom_hline(yintercept =1+3*p/n,linetype = 'dashed',colour = 'darkred' )+ geom_hline(yintercept =1-3*p/n,linetype = 'dashed',colour = 'darkred'  ) +xlab("Index")+ylab('Covratio') +   geom_text_repel(aes(label = txt), color = 'blue',na.rm = T)) + annotate("text",x= Inf,y=Inf,hjust = 1,vjust = 1,family = "serif",fontface = "italic", colour = "darkred",label = paste("Threshold:"," 1 +- ",round(3*p/n,2)))
+
+
+```
+
+##multicollinearity
+
+no violation of multicollinearity
+```{r}
+library("corrplot")
+corrtable = select(complete_NHANS, c('Age_c','BMI_c','Gender','Drugs','PhysActive','Smoker','AlcoholYear',"Race1"))
+corrtable$Gender = ifelse(corrtable$Gender== 'male',0,1)
+corrtable$Drugs = ifelse(corrtable$Drugs == 'No',0,1)
+corrtable$PhysActive = ifelse(corrtable$PhysActive == 'No',0,1)
+corrtable$Smoker = as.numeric(corrtable$Smoker)
+corrtable$Race1 = as.numeric(as.factor(corrtable$Race1))
+mycorr = corrplot(cor(corrtable))
+vif = car::vif(fit2)
+print(as.data.frame(vif))
+```
+
+
+
+
+
